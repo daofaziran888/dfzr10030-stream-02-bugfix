@@ -10,8 +10,8 @@ from datetime import datetime
 from typing import Any
 
 from app.fixtures import (
-    SOURCE_EVENTS, TRANSFORM_RECORDS, WINDOW_CONFIGS,
-    RULE_TRIGGERS, METRIC_DEFS, QUALITY_SAMPLES,
+    SOURCE_EVENTS,
+    RULE_TRIGGERS, QUALITY_SAMPLES,
     PARTITION_STATS, EVENT_ROUTES,
 )
 from app.store import store
@@ -61,45 +61,53 @@ def run_source_cdc_pipeline() -> dict:
 
 
 # Pipeline 2: stream_transform -> window_agg -> metric_calc
-def run_window_metric_pipeline(window_id: str | None = None) -> dict:
-    """执行窗口聚合并计算指标。"""
-    records = list(TRANSFORM_RECORDS)
-    configs = WINDOW_CONFIGS
-    if window_id:
-        configs = [c for c in configs if c["窗口编号"] == window_id]
+def run_window_metric_pipeline(window_id: str | None = None,
+                               late_policy: str | None = None) -> dict:
+    """执行分窗聚合并计算指标。
 
-    results: dict[str, Any] = {"total_records": len(records)}
-    for cfg in configs:
-        gmv = sum(_to_float(r["金额"]) for r in records)
-        cnt = len(records)
-        users = set(r["用户ID"] for r in records)
-        channel_dist: dict[str, int] = {}
-        for r in records:
-            channel_dist[r["渠道"]] = channel_dist.get(r["渠道"], 0) + 1
+    这条管道的输入仍是 TRANSFORM_RECORDS，但归桶、去重、迟到与封账全部交给
+    ``window_runtime``；指标计算只消费它产生的分窗聚合结果，并回写实际引用的
+    聚合批次，避免窗口聚合和指标计算各拿一份整批数据。
+    """
+    from app.services import metric_runtime, window_runtime
 
-        results[cfg["窗口编号"]] = {
-            "窗口类型": cfg["窗口类型"], "记录数": cnt,
-            "gmv": round(gmv, 2), "独立用户": len(users),
-            "平均订单": round(gmv / cnt, 2) if cnt else 0.0,
-            "渠道分布": channel_dist,
-        }
+    aggregation = window_runtime.run_windows(None, window_id=window_id, late_policy=late_policy)
+    metric_result = metric_runtime.run_metric_calculation(window_id=window_id, aggregation=aggregation)
 
-    # 聚合指标
-    metrics = {}
-    for m in METRIC_DEFS:
-        mid = m["指标编号"]
-        if "count" in m["计算公式"]:
-            metrics[mid] = len(records)
-        elif "sum" in m["计算公式"]:
-            metrics[mid] = round(sum(_to_float(r["金额"]) for r in records), 2)
-        elif "avg" in m["计算公式"]:
-            vals = [_to_float(r["金额"]) for r in records]
-            metrics[mid] = round(statistics.mean(vals), 2) if vals else 0.0
-        elif "distinct" in m["计算公式"]:
-            metrics[mid] = len(set(r["用户ID"] for r in records))
-
-    results["metrics"] = metrics
-    _wr("window_metric_calc", {"source": ["stream_transform", "window_agg"], "target": "metric_calc", "payload": results})
+    windows = aggregation.get("windows", {})
+    results: dict[str, Any] = {
+        "total_records": int(aggregation.get("input_records", 0) or 0),
+        "input_records": int(aggregation.get("input_records", 0) or 0),
+        "execution_id": aggregation.get("execution_id"),
+        "聚合批次引用": aggregation.get("聚合批次引用", []),
+        "批次": aggregation.get("批次", []),
+        "分桶": aggregation.get("分桶", []),
+        "迟到": aggregation.get("迟到", []),
+        "窗外": aggregation.get("窗外", []),
+        "重复投递": aggregation.get("重复投递", []),
+        "重复投递计数": aggregation.get("重复投递计数", 0),
+        "更正次数": aggregation.get("更正次数", 0),
+        "决策": aggregation.get("决策"),
+        "metric": {
+            "emission_id": metric_result.get("emission_id"),
+            "窗口编号": metric_result.get("窗口编号"),
+            "记录数": metric_result.get("记录数"),
+            "gmv": metric_result.get("gmv"),
+            "独立用户": metric_result.get("独立用户"),
+            "批次引用": metric_result.get("聚合批次引用", []),
+        },
+        "metrics": metric_result.get("metrics", {}),
+        "指标": metric_result.get("指标", []),
+    }
+    for wid, summary in windows.items():
+        results[wid] = summary
+    results["total_records"] = results["input_records"]
+    _wr("window_metric_calc", {
+        "source": ["stream_transform", "window_agg"], "target": "metric_calc",
+        "payload": results,
+        "聚合批次引用": results["聚合批次引用"],
+        "emission_id": metric_result.get("emission_id"),
+    })
     return results
 
 
@@ -126,17 +134,25 @@ def run_rule_router_pipeline() -> dict:
 
 # Pipeline 4: metric_calc -> pipeline_orch -> sink_writer
 def run_metric_sink_pipeline() -> dict:
-    """指标结果写入下游 sink。"""
+    """指标结果写入下游 sink；写入值携带本次引用的聚合批次。"""
     # 先跑 window_metric 拿到指标
     wm = run_window_metric_pipeline()
     metrics = wm.get("metrics", {})
+    emission_id = (wm.get("metric") or {}).get("emission_id")
+    batch_refs = wm.get("聚合批次引用", [])
 
     sinks: list[dict] = []
     for mid, val in metrics.items():
-        sinks.append({"指标编号": mid, "值": val, "写入时间": datetime.now().isoformat(), "写入状态": "成功"})
+        sinks.append({
+            "指标编号": mid, "值": val, "写入时间": datetime.now().isoformat(),
+            "写入状态": "成功", "emission_id": emission_id, "聚合批次引用": batch_refs,
+        })
 
-    result = {"sink_count": len(sinks), "sinks": sinks}
-    _wr("metric_pipeline_sink", {"source": ["metric_calc", "pipeline_orch"], "target": "sink_writer", "payload": result})
+    result = {"sink_count": len(sinks), "sinks": sinks, "emission_id": emission_id,
+              "聚合批次引用": batch_refs}
+    _wr("metric_pipeline_sink", {"source": ["metric_calc", "pipeline_orch"], "target": "sink_writer",
+                                 "payload": result, "emission_id": emission_id,
+                                 "聚合批次引用": batch_refs})
     return result
 
 

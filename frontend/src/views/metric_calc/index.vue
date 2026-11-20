@@ -56,6 +56,50 @@
       </tbody>
     </table>
 
+    <section class="bucket-panel" data-testid="metric-runtime-panel">
+      <header class="panel-head">
+        <div>
+          <h3>指标运行时 · 分窗口径</h3>
+          <p class="page-desc">指标计算消费分窗指标聚合结果，每个桶只引用一个批次版本；下面的批次清单就是本次指标实际引用的来源。</p>
+        </div>
+        <div class="page-actions">
+          <select v-model="metricQuery.window_id" data-testid="metric-window">
+            <option value="WIN-TUMBLE-60s">WIN-TUMBLE-60s</option>
+            <option value="WIN-SLIDE-30s">WIN-SLIDE-30s</option>
+            <option value="WIN-SESSION-5m">WIN-SESSION-5m</option>
+          </select>
+          <button class="btn" data-testid="run-metric" type="button" :disabled="runningMetric" @click="runMetric">
+            {{ runningMetric ? '计算中…' : '按窗口重算' }}
+          </button>
+          <button class="btn primary" data-testid="confirm-bucket" type="button" @click="confirmBucket">确认当前批次</button>
+        </div>
+      </header>
+
+      <div v-if="metricResult" class="metric-detail" data-testid="metric-detail">
+        <dl>
+          <dt>窗口编号</dt><dd>{{ metricResult.窗口编号 }}</dd>
+          <dt>桶数 / 记录数</dt><dd>{{ metricResult.桶数 }} / {{ metricResult.记录数 }}</dd>
+          <dt>金额(去重)</dt><dd>{{ metricResult.gmv }}</dd>
+          <dt>独立用户</dt><dd>{{ metricResult.独立用户 }}</dd>
+          <dt>最近发射</dt><dd class="batch-ref">{{ metricResult.最近发射?.emission_id || '尚未发射' }}</dd>
+        </dl>
+        <table class="data-table" data-testid="batch-ref-table">
+          <thead>
+            <tr><th>桶编号</th><th>聚合批次</th><th>版本</th><th>笔数</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="ref in metricResult.聚合批次引用" :key="String(ref.bucket_id)" :data-testid="`batch-${ref.bucket_id}`">
+              <td>{{ ref.bucket_id }}</td>
+              <td class="batch-ref">{{ ref.batch_id }}</td>
+              <td>{{ ref.版本 }}</td>
+              <td>{{ (metricResult.分桶 || []).find((b: any) => b.bucket_id === ref.bucket_id)?.记录数 ?? '—' }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p v-else class="page-desc">暂无分窗聚合结果，先在窗口聚合页执行一次分窗。</p>
+    </section>
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记实时指标</h3>
@@ -105,6 +149,67 @@ const stats = computed(() => [
   { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
   { label: metricNames[2], value: rows.value.filter((row) => row.status === statuses[statuses.length - 1]).length },
 ])
+
+const METRIC_ENDPOINT = '/api/metric_runtime'
+const metricQuery = ref({ window_id: 'WIN-TUMBLE-60s' })
+const metricResult = ref<Record<string, any> | null>(null)
+const runningMetric = ref(false)
+
+async function runMetric() {
+  runningMetric.value = true
+  errorMessage.value = ''
+  try {
+    const response = await request(`${METRIC_ENDPOINT}/run`, {
+      method: 'POST',
+      body: JSON.stringify({ window_id: metricQuery.value.window_id }),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) throw new Error(payload.detail || '指标计算失败')
+    metricResult.value = payload.result
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '指标计算失败'
+  } finally {
+    runningMetric.value = false
+  }
+}
+
+async function loadMetric() {
+  errorMessage.value = ''
+  try {
+    const response = await request(`${METRIC_ENDPOINT}/result?window_id=${metricQuery.value.window_id}`)
+    if (!response.ok) {
+      metricResult.value = null
+      return
+    }
+    metricResult.value = (await response.json()).result
+  } catch {
+    metricResult.value = null
+  }
+}
+
+async function confirmBucket() {
+  const first = metricResult.value?.聚合批次引用?.[0]
+  if (!first) {
+    errorMessage.value = '当前没有可确认的聚合批次'
+    return
+  }
+  errorMessage.value = ''
+  try {
+    const response = await request('/api/window_runtime/confirm', {
+      method: 'POST',
+      body: JSON.stringify({
+        bucket_id: first.bucket_id,
+        batch_id: first.batch_id,
+        emission_id: metricResult.value?.最近发射?.emission_id,
+      }),
+    })
+    const payload = await response.json()
+    if (!response.ok || !payload.ok) throw new Error(payload.message || '确认失败')
+    await loadMetric()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '确认失败'
+  }
+}
 
 function resetFilters() {
   filters.value = {}
@@ -184,5 +289,7 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(async () => {
+  await Promise.all([reload(), loadMetric()])
+})
 </script>

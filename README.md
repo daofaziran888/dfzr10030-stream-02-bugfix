@@ -75,5 +75,36 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 分窗运行时与指标口径
+
+窗口聚合不再按整批订单出数，而是按事件时间归桶后再聚合：
+
+- `app/services/window_runtime.py`：按窗口配置的 `窗口长度秒` / `滑动步长秒` 计算桶边界。
+  滚动窗口只落一个桶，滑动窗口按步长枚举，重叠部分允许同一订单进入多个桶；
+  同一桶内重复补投（含同一批次内）只计一次。
+- 水位按 `水位延迟秒` 推进，桶 `[开始, 结束)` 结束后封账。封账后在迟到阈值内到达的订单
+  生成新的计算批次，批次保留 `原桶引用`、`上一批次` 和 `本次纳入` 的记录范围；指标按桶
+  只选当前批次，不能同一指标混用两个桶版本。超出阈值的订单进入窗外记录，带落窗原因。
+- `app/services/metric_runtime.py`：只消费分窗聚合结果，产出指标与指标发射快照；
+  已发指标可按当时的桶 / 批次复算（`/api/metric_runtime/emissions/{id}/recompute`）。
+- 下游确认 `POST /api/window_runtime/confirm` 的订单范围与指标来源一致；可指定
+  `emission_id` 按当时引用的批次确认。
+
+主要接口：
+
+| 接口 | 说明 |
+| --- | --- |
+| `POST /api/window_runtime/run` | 分窗执行入口，返回实际引用的聚合批次 |
+| `GET /api/window_runtime/buckets` | 按窗口、时段、封账状态或订单编号筛选分桶 |
+| `GET /api/window_runtime/bucket-metrics` | 分桶指标清单：按桶查金额与独立用户 |
+| `GET /api/window_runtime/batches` | 批次版本、记录范围与更正关系 |
+| `GET /api/window_runtime/outside` | 窗外记录，按事件时段检索并带原因 |
+| `POST /api/window_runtime/confirm` | 下游确认（范围与指标来源一致） |
+| `POST /api/metric_runtime/run` | 消费分窗聚合结果计算指标 |
+| `GET /api/metric_runtime/{指标编号}` | 指标详情，交代实际引用的聚合批次 |
+
+迟到处理策略默认取环境变量 `WINDOW_LATE_POLICY`（`立即更正` 出数快但更正多，
+`延迟合并` 等下游确认后合并，更正少但出数慢），也可在分窗执行时按次指定。
+
 领域：数据工程
 子方向：数仓与数据湖

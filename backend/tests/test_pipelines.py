@@ -34,7 +34,29 @@ class TestWindowMetricPipeline:
         r = run_window_metric_pipeline()
         assert r["total_records"] == 10
         assert "WIN-TUMBLE-60s" in r
+        # 分窗结果按桶累加，滚动窗口 6 个桶各 1 分钟，合计仍是 10 笔。
+        assert r["WIN-TUMBLE-60s"]["桶数"] == 6
         assert r["WIN-TUMBLE-60s"]["记录数"] == 10
+
+    def test_buckets_do_not_reuse_whole_batch(self):
+        r = run_window_metric_pipeline()
+        buckets = r["WIN-TUMBLE-60s"]["分桶"]
+        assert [b["gmv"] for b in buckets] == [184.5, 409.9, 425.0, 542.5, 198.0, 67.8]
+        assert sum(b["gmv"] for b in buckets) == r["WIN-TUMBLE-60s"]["gmv"]
+
+    def test_pipeline_exposes_referenced_batches(self):
+        r = run_window_metric_pipeline()
+        assert r["聚合批次引用"]
+        assert r["metric"]["批次引用"]
+        assert {b["batch_id"] for b in r["metric"]["批次引用"]} <= {
+            b["batch_id"] for b in r["聚合批次引用"]
+        }
+        assert r["metric"]["emission_id"]
+
+    def test_metric_reads_window_aggregation(self):
+        r = run_window_metric_pipeline()
+        assert r["metrics"]["METR-ORDER-COUNT"] == 10
+        assert r["metrics"]["METR-GMV"] == r["WIN-TUMBLE-60s"]["gmv"]
 
     def test_gmv_calculation(self):
         r = run_window_metric_pipeline()

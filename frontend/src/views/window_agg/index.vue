@@ -56,6 +56,106 @@
       </tbody>
     </table>
 
+    <section class="bucket-panel" data-testid="bucket-panel">
+      <header class="panel-head">
+        <div>
+          <h3>分窗执行与订单归桶</h3>
+          <p class="page-desc">
+            窗口边界取自窗口配置；滚动窗口按窗口长度对齐，滑动窗口按滑动步长枚举，
+            同一订单可进入多个重叠桶，同一桶内重复补投只计一次。
+          </p>
+        </div>
+        <div class="page-actions">
+          <select v-model="bucketQuery.window_id" data-testid="bucket-window" @change="reloadBuckets">
+            <option value="">全部窗口</option>
+            <option v-for="cfg in windowConfigs" :key="cfg.窗口编号" :value="cfg.窗口编号">
+              {{ cfg.窗口编号 }}
+            </option>
+          </select>
+          <button class="btn primary" data-testid="run-buckets" type="button" :disabled="runningBuckets" @click="runBuckets">
+            {{ runningBuckets ? '归桶中…' : '执行分窗' }}
+          </button>
+          <button class="btn" data-testid="refresh-buckets" type="button" @click="reloadBuckets">刷新分桶</button>
+        </div>
+      </header>
+
+      <form class="filter-bar" @submit.prevent="reloadBuckets">
+        <label class="filter-item">
+          <span>事件时段起</span>
+          <input v-model="bucketQuery.start" data-testid="bucket-start" placeholder="2026-11-16T08:05:00Z" />
+        </label>
+        <label class="filter-item">
+          <span>事件时段止</span>
+          <input v-model="bucketQuery.end" data-testid="bucket-end" placeholder="2026-11-16T08:10:00Z" />
+        </label>
+        <label class="filter-item">
+          <span>订单编号</span>
+          <input v-model="bucketQuery.order_id" data-testid="bucket-order" placeholder="按订单定位桶" />
+        </label>
+        <button class="btn" data-testid="bucket-query" type="submit">按桶查询</button>
+      </form>
+
+      <div class="stat-row">
+        <article class="stat-card">
+          <span class="stat-label">分桶数</span>
+          <strong class="stat-value" data-testid="bucket-count">{{ bucketRows.length }}</strong>
+        </article>
+        <article class="stat-card">
+          <span class="stat-label">分桶金额合计</span>
+          <strong class="stat-value" data-testid="bucket-gmv">{{ bucketTotalGmv }}</strong>
+        </article>
+        <article class="stat-card">
+          <span class="stat-label">窗外记录</span>
+          <strong class="stat-value" data-testid="outside-count">{{ outsideRows.length }}</strong>
+        </article>
+      </div>
+
+      <table class="data-table" data-testid="bucket-table">
+        <thead>
+          <tr>
+            <th>桶编号</th>
+            <th>窗口时段</th>
+            <th>金额</th>
+            <th>笔数</th>
+            <th>独立用户</th>
+            <th>封账</th>
+            <th>聚合批次</th>
+            <th>记录范围</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="bucket in bucketRows" :key="String(bucket.bucket_id)" :data-testid="`bucket-${bucket.bucket_id}`">
+            <td>{{ bucket.bucket_id }}</td>
+            <td>{{ bucket.窗口开始 }} ~ {{ bucket.窗口结束 }}</td>
+            <td>{{ bucket.金额 ?? bucket.gmv }}</td>
+            <td>{{ bucket.记录数 }}</td>
+            <td>{{ bucket.独立用户 }}</td>
+            <td>{{ bucket.封账 ? '已封账' : '未封账' }}</td>
+            <td>{{ bucket.batch_id }} / v{{ bucket.版本 }}</td>
+            <td>{{ (bucket.记录范围 || []).join('、') || '—' }}</td>
+          </tr>
+          <tr v-if="!bucketRows.length">
+            <td colspan="8" class="empty-state">暂无分桶数据，先执行一次分窗</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <table v-if="outsideRows.length" class="data-table" data-testid="outside-table">
+        <thead>
+          <tr><th>窗外订单</th><th>事件时间</th><th>所属窗口</th><th>原本归属桶</th><th>原因</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="(row, index) in outsideRows" :key="`${row.record_id}-${row.window_id}-${index}`">
+            <td>{{ row.订单编号 || row.record_id }}</td>
+            <td>{{ row.event_time }}</td>
+            <td>{{ row.窗口编号 }}</td>
+            <td>{{ row.bucket_id || '—' }}</td>
+            <td>{{ row.原因 }}</td>
+          </tr>
+        </tbody>
+      </table>
+    </section>
+
     <div v-if="showCreate" class="modal-backdrop" data-testid="create-modal">
       <form class="modal" @submit.prevent="submitCreate">
         <h3>登记时间窗口</h3>
@@ -105,6 +205,60 @@ const stats = computed(() => [
   { label: metricNames[1], value: rows.value.filter((row) => row.status === statuses[1]).length },
   { label: metricNames[2], value: rows.value.filter((row) => row.status === statuses[statuses.length - 1]).length },
 ])
+
+type BucketRow = Record<string, any>
+const BUCKET_ENDPOINT = '/api/window_runtime'
+const bucketRows = ref<BucketRow[]>([])
+const outsideRows = ref<BucketRow[]>([])
+const windowConfigs = ref<BucketRow[]>([])
+const runningBuckets = ref(false)
+const bucketQuery = ref({ window_id: '', start: '', end: '', order_id: '' })
+const bucketTotalGmv = computed(() =>
+  bucketRows.value.reduce((sum, bucket) => sum + Number(bucket.金额 ?? bucket.gmv ?? 0), 0).toFixed(2),
+)
+
+async function runBuckets() {
+  runningBuckets.value = true
+  errorMessage.value = ''
+  try {
+    const response = await request(`${BUCKET_ENDPOINT}/run`, {
+      method: 'POST',
+      body: JSON.stringify({ window_id: bucketQuery.value.window_id || null }),
+    })
+    if (!response.ok) throw new Error('分窗执行失败，请稍后重试')
+    const payload = await response.json()
+    windowConfigs.value = payload.result?.窗口配置 ?? []
+    await reloadBuckets()
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '分窗执行失败'
+  } finally {
+    runningBuckets.value = false
+  }
+}
+
+async function reloadBuckets() {
+  errorMessage.value = ''
+  const query = new URLSearchParams()
+  if (bucketQuery.value.window_id) query.set('window_id', bucketQuery.value.window_id)
+  if (bucketQuery.value.start) query.set('start', bucketQuery.value.start)
+  if (bucketQuery.value.end) query.set('end', bucketQuery.value.end)
+  if (bucketQuery.value.order_id) query.set('order_id', bucketQuery.value.order_id)
+  try {
+    const [bucketResponse, outsideResponse, aggregationResponse] = await Promise.all([
+      request(`${BUCKET_ENDPOINT}/buckets?${query.toString()}`),
+      request(`${BUCKET_ENDPOINT}/outside?${query.toString()}`),
+      request(`${BUCKET_ENDPOINT}/aggregation${bucketQuery.value.window_id ? `?window_id=${bucketQuery.value.window_id}` : ''}`),
+    ])
+    if (!bucketResponse.ok) throw new Error('分桶结果读取失败')
+    bucketRows.value = (await bucketResponse.json()).items ?? []
+    outsideRows.value = outsideResponse.ok ? (await outsideResponse.json()).items ?? [] : []
+    if (aggregationResponse.ok) {
+      windowConfigs.value = (await aggregationResponse.json()).result?.窗口配置 ?? []
+    }
+  } catch (error) {
+    errorMessage.value = error instanceof Error ? error.message : '分桶结果读取失败'
+  }
+}
 
 function resetFilters() {
   filters.value = {}
@@ -184,5 +338,7 @@ async function reload() {
   }
 }
 
-onMounted(reload)
+onMounted(async () => {
+  await Promise.all([reload(), reloadBuckets()])
+})
 </script>

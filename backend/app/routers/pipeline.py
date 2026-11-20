@@ -1,6 +1,8 @@
 """跨模块管道接口：触发执行并查询结果。"""
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter
 
 from app.services.pipeline_orchestrator import (
@@ -30,8 +32,13 @@ def trigger_source_cdc() -> dict:
 
 
 @router.post("/window-metric")
-def trigger_window_metric() -> dict:
-    return {"ok": True, "result": run_window_metric_pipeline()}
+def trigger_window_metric(payload: dict[str, Any] | None = None) -> dict:
+    """信任参数里的 window_id / late_policy，交给分窗运行时和指标运行时。"""
+    payload = payload or {}
+    return {"ok": True, "result": run_window_metric_pipeline(
+        window_id=payload.get("window_id"),
+        late_policy=payload.get("late_policy"),
+    )}
 
 
 @router.post("/rule-router")
